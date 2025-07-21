@@ -1,0 +1,529 @@
+package com.anjia.unidbgserver;
+
+import com.github.unidbg.AndroidEmulator;
+import com.github.unidbg.Emulator;
+import com.github.unidbg.Module;
+import com.github.unidbg.arm.backend.Unicorn2Factory;
+import com.github.unidbg.arm.context.RegisterContext;
+import com.github.unidbg.debugger.BreakPointCallback;
+import com.github.unidbg.debugger.Debugger;
+import com.github.unidbg.file.FileResult;
+import com.github.unidbg.file.IOResolver;
+import com.github.unidbg.linux.android.AndroidEmulatorBuilder;
+import com.github.unidbg.linux.android.AndroidResolver;
+import com.github.unidbg.linux.android.dvm.*;
+import com.github.unidbg.linux.android.dvm.api.AssetManager;
+import com.github.unidbg.linux.android.dvm.array.ArrayObject;
+import com.github.unidbg.linux.android.dvm.array.ByteArray;
+import com.github.unidbg.memory.Memory;
+import com.github.unidbg.pointer.UnidbgPointer;
+import com.github.unidbg.utils.Inspector;
+import com.github.unidbg.virtualmodule.android.AndroidModule;
+import com.github.unidbg.virtualmodule.android.JniGraphics;
+import com.github.unidbg.virtualmodule.android.MediaNdkModule;
+import com.github.unidbg.virtualmodule.android.SystemProperties;
+import com.anjia.unidbgserver.utils.TempFileUtils;
+import unicorn.Arm64Const;
+
+import java.io.IOException;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.PrintStream;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.io.File;
+
+import java.nio.charset.StandardCharsets;
+import com.github.unidbg.arm.context.Arm64RegisterContext;
+import com.github.unidbg.memory.MemoryBlock;
+import java.util.Map;
+
+
+public class demo extends AbstractJni implements IOResolver {
+    private final AndroidEmulator emulator;
+    private final VM vm;
+    // private Module ksxgsModule;
+    private Module ksxgsModule;
+    public FileResult resolve(Emulator emulator, String pathname, int oflags) {
+        System.out.println("open file:" + pathname);
+        return null;
+    }
+    demo(){
+        // 创建模拟器实例
+        emulator = AndroidEmulatorBuilder.for64Bit().setProcessName("com.smile.gifmaker").build();
+        emulator.getSyscallHandler().addIOResolver(this);
+
+        // 获取模拟器的内存操作接口
+        final Memory memory = emulator.getMemory();
+        // 设置系统类库解析
+        memory.setLibraryResolver(new AndroidResolver(23));
+//        memory.addModuleListener(new SearchData("9b332a80a8edcc723e9dbf64c13e24c2975451929dc2085c3a8249dd01820eaefe4d8c7b7861bf24b98819c5f46e0878", "lib.so", 1000));
+        // 创建Android虚拟机,传入APK，Unidbg可以替我们做部分签名校验的工作
+         // 创建Android虚拟机,传入APK，Unidbg可以替我们做部分签名校验的工作
+        try {
+            vm = emulator.createDalvikVM(TempFileUtils.getTempFile("kuaishou/13.6.10.apk"));
+        } catch (IOException e) {
+            System.out.println("[ERROR] demo 构造函数异常: " + e.getMessage());
+            throw new RuntimeException(e);
+        }
+        // 4个虚拟模块
+        System.out.println("=== 开始注册虚拟模块 ===");
+        System.out.println("1. 注册 MediaNdkModule");
+        new MediaNdkModule(emulator,vm).register(memory);
+        System.out.println("2. 注册 JniGraphics");
+        new JniGraphics(emulator,vm).register(memory);
+        System.out.println("3. 注册 SystemProperties");
+        new SystemProperties(emulator,null).register(memory);
+        System.out.println("4. 注册 MyAndroidModule (最后注册，确保优先级)");
+        MyAndroidModule myAndroidModule = new MyAndroidModule(emulator,vm);
+        myAndroidModule.register(memory);
+        System.out.println("=== 虚拟模块注册完成 ===");
+
+        // 设置JNI
+        vm.setJni(this);
+        // 打印日志
+        vm.setVerbose(true);
+
+        // 在加载SO之前，先检查符号是否已经注册
+        System.out.println("=== 检查符号注册状态 ===");
+        try {
+            // 尝试获取已注册的符号
+            com.github.unidbg.Module androidModule = emulator.getMemory().findModule("libandroid.so");
+            if (androidModule != null) {
+                System.out.println("找到 libandroid.so 模块: " + androidModule);
+                // 这里可以添加更多调试信息
+            } else {
+                System.out.println("警告: 未找到 libandroid.so 模块");
+            }
+        } catch (Exception e) {
+            System.out.println("检查符号注册状态时出错: " + e.getMessage());
+        }
+        System.out.println("=== 符号注册状态检查完成 ===");
+
+        // 加载目标SO
+//         DalvikModule dm = vm.loadLibrary("ksxgs", true);
+        // DalvikModule dmKste = vm.loadLibrary(new File("src/main/resources/data/apks/so/libkste.so"), true);
+        // ksteModule = dmKste.getModule();
+        // dmKste.callJNI_OnLoad(emulator);
+
+        System.out.println("开始加载 ksxgs.so...");
+        DalvikModule dmKsxgs = vm.loadLibrary("ksxgs", true);
+        ksxgsModule = dmKsxgs.getModule();
+        System.out.println("ksxgs.so 加载完成，模块基址: 0x" + Long.toHexString(ksxgsModule.base));
+        dmKsxgs.callJNI_OnLoad(emulator);
+        System.out.println("ksxgs.so JNI_OnLoad 调用完成");
+
+
+//      // 立刻设置断点
+//       Debugger debugger = emulator.attach();
+//       debugger.addBreakPoint(ksxgsModule.base + 0x28e98, new BreakPointCallback() {
+//
+//           @Override
+//           public boolean onHit(Emulator<?> emulator, long address) {
+//               System.out.println("【onHit】---------onHit-----------: ");
+//               RegisterContext context = emulator.getContext();
+//               long x0 = context.getLongArg(0);
+//               UnidbgPointer ptr = UnidbgPointer.pointer(emulator, x0);
+//               if (ptr != null) {
+//                   String str = ptr.getString(0);
+//                   System.out.println("NewStringUTF at 0x28e98, X0 as string: " + str);
+//               }
+//               return false;
+//           }
+//       });
+    };
+
+//    public void callByAddress(){
+//        // args list
+//        List<Object> list = new ArrayList<>(10);
+//        // jnienv
+//        list.add(vm.getJNIEnv());
+//        // jclazz
+//        list.add(0);
+//        // str1
+//        list.add(vm.addLocalObject(new StringObject(vm, "str1")));
+//        // strArr 假设字符串包含两个字符串
+//        // str6_1
+//        StringObject str6_1 = new StringObject(vm, "str6_1");
+//        vm.addLocalObject(str6_1);
+//        // str6_2
+//        StringObject str6_2 = new StringObject(vm, "str6_2");
+//        vm.addLocalObject(str6_2);
+//        ArrayObject arrayObject = new ArrayObject(str6_1,str6_2);
+//        list.add(vm.addLocalObject(arrayObject));
+//        // 最后的int
+//        list.add(1);
+//        Number number = module.callFunction(emulator, 0x2301, list.toArray());
+//        ArrayObject resultArr = vm.getObject(number.intValue());
+//        System.out.println("result:"+resultArr);
+//    };
+
+//    @Override
+    public boolean onHit(Emulator<?> emulator, long address) {
+        RegisterContext context = emulator.getContext();
+        long x1 = context.getLongArg(1); // x1=sp+0x540
+        UnidbgPointer ptr = UnidbgPointer.pointer(emulator, x1);
+        if (ptr != null) {
+            String str = ptr.getString(0);
+            System.out.println("【NewStringUTF前】x1 as string: " + str);
+            byte[] mem = ptr.getByteArray(0, 0x40);
+            com.github.unidbg.utils.Inspector.inspect(mem, "dump x1");
+        }
+        // 继续打印x0（NewStringUTF参数）内容
+        long x0 = context.getLongArg(0);
+        UnidbgPointer ptr0 = UnidbgPointer.pointer(emulator, x0);
+        if (ptr0 != null) {
+            String str0 = ptr0.getString(0);
+            System.out.println("【NewStringUTF参数】x0 as string: " + str0);
+            byte[] mem0 = ptr0.getByteArray(0, 0x40);
+            com.github.unidbg.utils.Inspector.inspect(mem0, "dump x0");
+        }
+        return false;
+    }
+
+    public void callByAPI(){
+        DvmClass RequestCryptUtils = vm.resolveClass("com/meituan/android/payguard/RequestCryptUtils");
+        StringObject str6_1 = new StringObject(vm, "str6_1");
+        vm.addLocalObject(str6_1);
+        StringObject str6_2 = new StringObject(vm, "str6_2");
+        vm.addLocalObject(str6_2);
+        ArrayObject arrayObject = new ArrayObject(str6_1,str6_2);
+        ArrayObject result = RequestCryptUtils.callStaticJniMethodObject(emulator, "encryptRequestWithRandom()", "str1","str2", "str3","str4","str5",arrayObject,1);
+        System.out.println(result);
+    };
+
+    public static void main(String[] args) {
+        try {
+            // 创建日志文件的输出流
+            PrintStream logStream = new PrintStream(new FileOutputStream("log.txt", true), true);
+            // 重定向 System.out 到 log.txt
+            System.setOut(logStream);
+            System.setErr(logStream); // 如果你也想把错误日志一起记录
+        } catch (FileNotFoundException e) {
+            e.printStackTrace();
+        }
+
+        demo demo = new demo();
+//        demo.HookByConsoleDebugger();
+//        demo.patch(); // <-- 这里加上 patch
+        demo.init();
+        demo.callByAddress();
+    }
+
+    public void HookByConsoleDebugger() {
+        Debugger debugger = emulator.attach();
+
+        debugger.addBreakPoint(ksxgsModule.base + 0x12345, new BreakPointCallback() {
+            @Override
+            public boolean onHit(Emulator<?> emulator, long address) {
+                long sp = emulator.getContext().getLongArg(31);
+                long traceAddr = sp + 0x540;
+                UnidbgPointer ptr = UnidbgPointer.pointer(emulator, traceAddr);
+                if (ptr != null) {
+                    String str = ptr.getString(0);
+                    System.out.println("[断点打印] sp+0x540内容: " + str);
+                }
+                return false; // 断点后继续执行
+            }
+        });
+
+        debugger.addBreakPoint(0x4019ca18, new BreakPointCallback() {
+            @Override
+            public boolean onHit(Emulator<?> emulator, long address) {
+                RegisterContext ctx = emulator.getContext();
+                long x0 = ctx.getLongArg(0);
+                long x1 = ctx.getLongArg(1);
+                UnidbgPointer p0 = UnidbgPointer.pointer(emulator, x0);
+                UnidbgPointer p1 = UnidbgPointer.pointer(emulator, x1);
+                String s0 = p0 != null ? p0.getString(0) : "null";
+                String s1 = p1 != null ? p1.getString(0) : "null";
+                System.out.println("[strcmp断点] x0=" + Long.toHexString(x0) + " x1=" + Long.toHexString(x1));
+                System.out.println("[strcmp断点] x0内容: " + s0);
+                System.out.println("[strcmp断点] x1内容: " + s1);
+                return false;
+            }
+        });
+     }
+
+
+    public void trace(){
+        String traceFile = "unidbg-android/src/test/java/com/demo/demo/trace/trace.txt";
+        PrintStream traceStream = null;
+        try{
+            traceStream = new PrintStream(new FileOutputStream(traceFile), true);
+        } catch (FileNotFoundException e) {
+            e.printStackTrace();
+        }
+        //核心 trace 开启代码，也可以自己指定函数地址和偏移量
+        emulator.traceCode(ksxgsModule.base,ksxgsModule.base+ksxgsModule.size).setRedirect(traceStream);
+    }
+
+    public void patch(){
+        Debugger debugger = emulator.attach();
+        debugger.addBreakPoint(0x40000000 + 0x2934c, new BreakPointCallback() {
+            @Override
+            public boolean onHit(Emulator<?> emulator, long address) {
+                emulator.getBackend().reg_write(Arm64Const.UC_ARM64_REG_X0, 0x1); // AAssetManager_openDir
+                return true;
+            }
+        });
+
+    }
+
+    public void init(){
+            System.out.println("init:-------------------------------");
+
+            // 添加断点监控 0x26d68 函数
+            Debugger debugger = emulator.attach();
+            debugger.addBreakPoint(ksxgsModule.base + 0x26d68, new BreakPointCallback() {
+                @Override
+                public boolean onHit(Emulator<?> emulator, long address) {
+                    System.out.println("=== 断点触发：0x26d68 函数被调用 ===");
+                    System.out.println("调用地址: 0x" + Long.toHexString(address));
+                    // 打印调用栈
+                    Thread.dumpStack();
+                    return false; // 继续执行
+                }
+            });
+            System.out.println("已设置断点监控 0x26d68 函数");
+//
+//             emulator.traceCode(ksxgsModule.base, ksxgsModule.base+ ksxgsModule.size);
+        //    // args list
+        //    List<Object> list = new ArrayList<>(10);
+        //    // jnienv
+        //    list.add(vm.getJNIEnv());
+        //    // jclazz
+        //    list.add(0);
+
+        //    DvmObject<?> context = vm.resolveClass("android/app/Application").newObject(null); // context
+        //    list.add(vm.addLocalObject(context));
+        //    // str1
+        //    list.add(vm.addLocalObject(new StringObject(vm, "[{\"uuid\":\"2f3e68b0-9a52-4f53-9109-7ea8e9dbe89a\",\"version\":0,\"bits\":32,\"cdn_url\":\"\",\"file_md5\":\"\",\"vm_bc_path\":\"\"}]")));
+
+        //    // list.add(vm.addLocalObject(new StringObject(vm, "[{\"uuid\":\"2f3e68b0-9a52-4f53-9109-7ea8e9dbe89a\",\"version\":0,\"bits\":32,\"cdn_url\":\"\",\"file_md5\":\"\",\"vm_bc_path\":\"\"}]")));
+        //    Number number = ksxgsModule.callFunction(emulator, 0x26d68, list.toArray());
+
+        // //    ArrayObject resultArr = vm.getObject(number.intValue());
+        //    System.out.println("init:"+number);
+
+
+
+        // 3. 获取GNative类
+        DvmClass gNativeClass = vm.resolveClass("com/kuaishou/security/xgs/logic/base/GNative");
+
+        // 4. 构造参数
+        // context参数：创建一个正确的 Application 对象，而不是 StringObject
+        DvmObject<?> context = vm.resolveClass("android/app/Application").newObject(null); // context
+
+
+        // str参数
+        String str = "[{\"uuid\":\"2f3e68b0-9a52-4f53-9109-7ea8e9dbe89a\",\"version\":0,\"bits\":32,\"cdn_url\":\"\",\"file_md5\":\"\",\"vm_bc_path\":\"\"}]";
+
+
+        List<Object> list = new ArrayList<>(10);
+        list.add(vm.getJNIEnv()); // JNIEnv
+        list.add(0);              // jclass
+        list.add(vm.addLocalObject(context)); // context参数
+        list.add(vm.addLocalObject(new StringObject(vm, str))); // str参数
+        list.add(2096);
+
+
+        System.out.println("context: " + context);
+        System.out.println("str: " + str);
+        System.out.println("准备调用 callFunction...");
+        Number number = ksxgsModule.callFunction(emulator, 0x26d68, list.toArray());
+
+
+
+
+        // // 5. 调用静态native方法
+        // DvmObject<?> result = gNativeClass.callStaticJniMethodObject(
+        //     emulator,
+        //     "a(Landroid/content/Context;Ljava/lang/String;)[Ljava/lang/String;",
+        //     context,
+        //     str
+        // );
+
+           // 取出返回的 Java Object
+        DvmObject<?> resultObj = vm.getObject(number.intValue());
+        if (resultObj instanceof ArrayObject) {
+            ArrayObject arr = (ArrayObject) resultObj;
+            Object[] values = arr.getValue();
+            for (Object v : values) {
+                System.out.println("[DEBUG] init result array element: " + v);
+            }
+        } else if (resultObj != null) {
+            System.out.println("[DEBUG] init result: " + resultObj.getValue());
+        } else {
+            System.out.println("[DEBUG] init result is null");
+        }
+
+    }
+
+
+
+
+
+
+    public void callByAddress(){
+
+        System.out.println("callByAddress:-------------------------------");
+//        emulator.traceCode(ksxgsModule.base, ksxgsModule.base+ ksxgsModule.size);
+
+        // 如果上面的调用不成功，尝试原来的 0x27b38 函数
+        System.out.println("\n尝试调用 0x27b38 函数...");
+        List<Object> list2 = new ArrayList<>(10);
+        list2.add(vm.getJNIEnv());
+        list2.add(0);
+        list2.add(vm.addLocalObject(new StringObject(vm, "2f3e68b0-9a52-4f53-9109-7ea8e9dbe89a")));
+
+        final String string1 =
+        "/rest/n/starLink/info"
+        + "abi=arm32"
+        + "androidApiLevel=31"
+        + "android_os=0"
+        + "app=0"
+        + "appver=13.6.10.42786"
+        + "boardPlatform=sdm845"
+        + "bottom_navigation=false"
+        + "browseType=4"
+        + "c=JINGMEI_BAIDU_PINZHUAN,1"
+        + "cdid_tag=2"
+        + "client_info_list={\"network_info\":{\"collectionTime\":1752730518153,\"netType\":\"WIFI\",\"operator\":\"46000\",\"netScore\":57,\"netSpeed\":21846}}"
+        + "client_key=3c2cd3f3"
+        + "cold_launch_time_ms=1752730494217"
+        + "country_code=cn"
+        + "cs=false"
+        + "darkMode=false"
+        + "ddpi=560"
+        + "deviceBit=0"
+        + "device_abi=arm64"
+        + "did=ANDROID_450573b7d766e1d4"
+        + "did_gt=1752048750871"
+        + "did_tag=0"
+        + "earphoneMode=1"
+        + "egid=DFP225C80DFE9ED6B377586E4E7D71D6018E07C6A07635E506F1ADBB16D14727"
+        + "ftt=grant_browse_type=AUTHORIZED"
+        + "hotfix_ver=icaver=1"
+        + "is_background=0"
+        + "isp=CMCC"
+        + "iuid=kcv=1599"
+        + "keyconfig_state=2"
+        + "kpf=ANDROID_PHONE"
+        + "kpn=KUAISHOU"
+        + "language=zh-cn"
+        + "max_memory=256"
+        + "mod=Google(Pixel 3 XL)"
+        + "nbh=168"
+        + "net=WIFI"
+        + "newOc=JINGMEI_BAIDU_PINZHUAN,1"
+        + "oDid=ANDROID_58b3cb2bd13b7084"
+        + "oc=JINGMEI_BAIDU_PINZHUAN,1"
+        + "os=android"
+        + "rdid=ANDROID_92ec45bf153573da"
+        + "sbh=171"
+        + "sh=2960"
+        + "slh=0"
+        + "socName=Qualcomm Snapdragon 845"
+        + "sw=1440"
+        + "sys=ANDROID_12"
+        + "thermal=10000"
+        + "totalMemory=3579"
+        + "uQaTag=ud=0"
+        + "userRecoBit=0"
+        + "ver=13.6"
+        + "videoModelCrowdTag=";
+         byte[] bytes = string1.getBytes();
+         ByteArray arr = new ByteArray(vm, bytes);
+         list2.add(vm.addLocalObject(arr));
+         list2.add(2096);
+
+        Number number2 = ksxgsModule.callFunction(emulator, 0x27b38, list2.toArray());
+        System.out.println("0x27b38 函数返回值: " + number2);
+
+        DvmObject<?> resultObj2 = vm.getObject(number2.intValue());
+        System.out.println("0x27b38 结果对象类型: " + (resultObj2 != null ? resultObj2.getClass().getSimpleName() : "null"));
+
+        if (resultObj2 instanceof ByteArray) {
+            ByteArray resultArr2 = (ByteArray) resultObj2;
+            byte[] resultBytes2 = resultArr2.getValue();
+            System.out.println("0x27b38 结果字节数组长度: " + (resultBytes2 != null ? resultBytes2.length : "null"));
+
+            if (resultBytes2 != null && resultBytes2.length > 0) {
+                System.out.println("0x27b38 sig4:" + new String(resultBytes2, StandardCharsets.UTF_8));
+            } else {
+                System.out.println("0x27b38 sig4: 返回的字节数组为空或长度为0");
+            }
+        } else if (resultObj2 != null) {
+            System.out.println("0x27b38 sig4: 返回的不是ByteArray类型，而是: " + resultObj2.getValue());
+        } else {
+            System.out.println("0x27b38 sig4: 返回的对象为null");
+        }
+
+
+
+
+
+        // DvmClass gNativeClass = vm.resolveClass("com/kuaishou/security/xgs/logic/base/GNative");
+        // StringObject str1 = new StringObject(vm, "2f3e68b0-9a52-4f53-9109-7ea8e9dbe89a");
+        // // 直接使用上面已经创建的 str1 和 arr
+        // ByteArray resultArr = (ByteArray) gNativeClass.callStaticJniMethodObject(
+        //         emulator,
+        //         "b(Ljava/lang/String;[BI)[B",
+        //         str1, arr, 2096
+        // );
+        // System.out.println(javax.xml.bind.DatatypeConverter.printHexBinary(resultArr.getValue()));
+        // if (resultArr != null) {
+        //     System.out.println("resultArr bytes: " + Arrays.toString(resultArr.getValue()));
+        //     System.out.println("resultArr string: " + new String(resultArr.getValue(), StandardCharsets.UTF_8));
+        // } else {
+        //     System.out.println("resultArr is null");
+        // }
+    };
+
+    @Override
+    public DvmObject<?> callObjectMethod(BaseVM vm, DvmObject<?> dvmObject, String signature, VarArg varArg) {
+        switch (signature) {
+            case "android/app/Application->getAssets()Landroid/content/res/AssetManager;":
+                return new AssetManager(vm, signature);
+            case "android/content/Context->getAssets()Landroid/content/res/AssetManager;":
+                return new AssetManager(vm, signature);
+            case "android/content/Context->getPackageName()Ljava/lang/String;":
+                return new StringObject(vm, "com.smile.gifmaker");
+            case "android/content/Context->getFilesDir()Ljava/io/File;":
+                // 返回一个假的 File 对象
+                return new StringObject(vm, "/data/data/com.smile.gifmaker/files");
+            case "android/content/Context->getApplicationContext()Landroid/content/Context;":
+                return dvmObject; // 返回自己
+            // 其他 context 相关方法可继续补充
+        }
+        return super.callObjectMethod(vm, dvmObject, signature, varArg);
+    }
+
+    @Override
+    public void callStaticVoidMethod(BaseVM vm, DvmClass dvmClass, String signature, VarArg varArg) {
+        switch (signature){
+            case "com/kuaishou/security/kste/logic/report/LogProxy->nativeReport(ILjava/lang/String;)V":{
+                // 直接返回，不做处理，避免抛异常
+                return;
+            }
+            case "com/kuaishou/security/xgs/logic/report/XLogProxy->nativeReport(IILjava/lang/String;)V":{
+                return;
+            }
+        }
+        super.callStaticVoidMethod(vm, dvmClass, signature, varArg);
+    }
+
+    public DvmObject<?> getStaticField(BaseVM vm, DvmClass dvmClass, String signature) {
+        if ("com/kwai/framework/network/util/j->f75662d:Z".equals(signature)) {
+            System.out.printf("signature------------%s\n", signature);
+            // 返回 Boolean 类型对象
+            // return new DvmObject<Boolean>(vm.resolveClass("java/lang/Boolean"), Boolean.TRUE);
+        }
+        // 父类没有 getStaticField 方法，直接返回 null
+        return null;
+    }
+
+
+}
